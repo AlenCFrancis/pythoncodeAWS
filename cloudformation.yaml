@@ -1,0 +1,496 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ICT Academy Kerala - AWS Cloud Deployment Project: Secure Flask Web Application on EC2 with RDS MySQL and S3 in ap-south-1'
+
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for RDS MySQL (minimum 8 characters)
+    MinLength: 8
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair used for SSH access
+  SSHLocation:
+    Type: String
+    Description: The IP address range (CIDR) permitted to SSH to the EC2 instance (e.g. YOUR_PUBLIC_IP/32). Do not use 0.0.0.0/0.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}\/([0-9]|[1-2][0-9]|3[0-2])$'
+    ConstraintDescription: Must be a valid IPv4 CIDR range of the form x.x.x.x/x (e.g. 203.0.113.50/32).
+
+Resources:
+  # =========================================================================
+  # PART A: Networking (VPC, Subnets, Routing)
+  # =========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: student-app-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: student-app-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-subnet-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: public-route-table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: private-route-table
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =========================================================================
+  # PART B: Security Groups
+  # =========================================================================
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 web server
+      VpcId: !Ref VPC
+      GroupName: web-sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: Allow SSH from specified IP
+      Tags:
+        - Key: Name
+          Value: web-sg
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS MySQL database (accessible only from web-sg)
+      VpcId: !Ref VPC
+      GroupName: db-sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: Allow MySQL access strictly from web-sg
+      Tags:
+        - Key: Name
+          Value: db-sg
+
+  # =========================================================================
+  # PART C & D: S3 Bucket & IAM Role
+  # =========================================================================
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'student-photos-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObjectOnly
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${S3Bucket}/*'
+
+  EC2S3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ec2-s3-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2S3ScopedAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::${S3Bucket}/*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ec2-s3-role-profile
+      Roles:
+        - !Ref EC2S3Role
+
+  # =========================================================================
+  # PART E: RDS MySQL (Private Subnet)
+  # =========================================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: student-db-subnet-group
+      DBSubnetGroupDescription: Subnet group for RDS MySQL in private subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: student-db-subnet-group
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: student-mysql-db
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      StorageType: gp2
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBName: studentdb
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DeleteAutomatedBackups: true
+      Tags:
+        - Key: Name
+          Value: student-rds-mysql
+
+  # =========================================================================
+  # PART F: EC2 Web Application Instance
+  # =========================================================================
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - RDSInstance
+      - S3Bucket
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: student-flask-web-app
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          dnf update -y
+          dnf install -y python3-pip git mariadb105
+
+          # Wait for RDS MySQL to accept connections
+          until mysqladmin ping -h ${RDSInstance.Endpoint.Address} -u admin -p'${DBPassword}' --silent; do
+            echo "Waiting for RDS MySQL to accept connections..."
+            sleep 5
+          done
+
+          # Create MySQL table
+          mysql -h ${RDSInstance.Endpoint.Address} -u admin -p'${DBPassword}' studentdb <<'EOF'
+          CREATE TABLE IF NOT EXISTS students (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email VARCHAR(150) NOT NULL,
+            course VARCHAR(100),
+            photo_url VARCHAR(500)
+          );
+          EOF
+
+          # Setup project directory
+          mkdir -p /home/ec2-user/pythoncodeAWS/templates
+          cd /home/ec2-user/pythoncodeAWS
+
+          # Pull application code
+          curl -s https://raw.githubusercontent.com/gops601/pythoncodeAWS/main/requirements.txt -o requirements.txt
+          pip3 install -r requirements.txt
+          pip3 install pymysql cryptography gunicorn boto3 flask
+
+          # Write app.py with environment variable configuration
+          cat <<'EOF' > app.py
+          import os
+          import pymysql
+          import boto3
+          from flask import Flask, render_template, request, redirect, url_for, flash
+
+          app = Flask(__name__)
+          app.secret_key = os.environ.get("FLASK_SECRET_KEY", "student-app-secret-key-2026")
+
+          bucket_name = os.environ.get("S3_BUCKET_NAME")
+          region = os.environ.get("AWS_REGION", "ap-south-1")
+
+          def get_db_connection():
+              return pymysql.connect(
+                  host=os.environ.get("DB_HOST"),
+                  port=int(os.environ.get("DB_PORT", 3306)),
+                  user=os.environ.get("DB_USER"),
+                  password=os.environ.get("DB_PASSWORD"),
+                  database=os.environ.get("DB_NAME", "studentdb"),
+                  autocommit=True
+              )
+
+          @app.route('/')
+          def home():
+              return render_template('index.html')
+
+          @app.route('/health')
+          def health():
+              return {"status": "healthy"}, 200
+
+          @app.route('/register', methods=['POST'])
+          def register():
+              name = request.form.get('name')
+              email = request.form.get('email')
+              course = request.form.get('course')
+              photo = request.files.get('photo')
+
+              if not name or not email or not course or not photo:
+                  return "All fields including photo are required.", 400
+
+              s3 = boto3.client('s3', region_name=region)
+              filename = photo.filename
+
+              s3.upload_fileobj(
+                  photo,
+                  bucket_name,
+                  filename,
+                  ExtraArgs={'ContentType': photo.content_type} if photo.content_type else None
+              )
+
+              photo_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{filename}"
+
+              db = get_db_connection()
+              try:
+                  with db.cursor() as cursor:
+                      sql = """
+                      INSERT INTO students (name, email, course, photo_url)
+                      VALUES (%s, %s, %s, %s)
+                      """
+                      cursor.execute(sql, (name, email, course, photo_url))
+                  db.commit()
+              finally:
+                  db.close()
+
+              return f"""
+              <!DOCTYPE html>
+              <html>
+              <head>
+                  <title>Registration Successful</title>
+                  <style>
+                      body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f4f7f6; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+                      .card {{ background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); max-width: 480px; text-align: center; }}
+                      h2 {{ color: #16a34a; margin-top: 0; }}
+                      img {{ width: 140px; height: 140px; object-fit: cover; border-radius: 50%; margin: 15px 0; border: 3px solid #e2e8f0; }}
+                      p {{ color: #475569; margin: 8px 0; }}
+                      .btn {{ display: inline-block; margin-top: 20px; padding: 10px 20px; background: #2563eb; color: white; text-decoration: none; border-radius: 6px; }}
+                  </style>
+              </head>
+              <body>
+                  <div class="card">
+                      <h2>Student Registered Successfully!</h2>
+                      <img src="{photo_url}" alt="Student Photo" onerror="this.src='https://via.placeholder.com/140?text=Photo';">
+                      <p><strong>Name:</strong> {name}</p>
+                      <p><strong>Email:</strong> {email}</p>
+                      <p><strong>Course:</strong> {course}</p>
+                      <p><strong>Photo URL:</strong> <a href="{photo_url}" target="_blank">View on S3</a></p>
+                      <a href="/" class="btn">Register Another Student</a>
+                  </div>
+              </body>
+              </html>
+              """
+
+          if __name__ == '__main__':
+              app.run(host="0.0.0.0", port=5000, debug=False)
+          EOF
+
+          # Write templates/index.html
+          cat <<'EOF' > templates/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Student Registration</title>
+              <style>
+                  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }
+                  body { background: #f0f4f8; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+                  .container { background: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.08); width: 100%; max-width: 460px; }
+                  h1 { font-size: 24px; color: #1e293b; margin-bottom: 8px; text-align: center; }
+                  p.subtitle { font-size: 14px; color: #64748b; text-align: center; margin-bottom: 28px; }
+                  .form-group { margin-bottom: 20px; }
+                  label { display: block; font-size: 14px; font-weight: 600; color: #334155; margin-bottom: 6px; }
+                  input[type="text"], input[type="email"] { width: 100%; padding: 12px 14px; border: 1.5px solid #cbd5e1; border-radius: 8px; font-size: 15px; outline: none; transition: border-color 0.2s; }
+                  input[type="text"]:focus, input[type="email"]:focus { border-color: #2563eb; }
+                  input[type="file"] { width: 100%; padding: 10px; border: 1.5px dashed #94a3b8; border-radius: 8px; font-size: 14px; background: #f8fafc; cursor: pointer; }
+                  button[type="submit"] { width: 100%; padding: 14px; background: #2563eb; color: #ffffff; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; margin-top: 10px; }
+                  button[type="submit"]:hover { background: #1d4ed8; }
+                  .badge { display: inline-block; background: #e0f2fe; color: #0369a1; font-size: 12px; padding: 4px 8px; border-radius: 4px; margin-top: 15px; text-align: center; width: 100%; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>Student Registration</h1>
+                  <p class="subtitle">Deploying a Secure Flask Web Application on AWS</p>
+                  <form action="/register" method="POST" enctype="multipart/form-data">
+                      <div class="form-group">
+                          <label for="name">Full Name</label>
+                          <input type="text" id="name" name="name" placeholder="John Doe" required>
+                      </div>
+                      <div class="form-group">
+                          <label for="email">Email Address</label>
+                          <input type="email" id="email" name="email" placeholder="john@example.com" required>
+                      </div>
+                      <div class="form-group">
+                          <label for="course">Course</label>
+                          <input type="text" id="course" name="course" placeholder="Cloud Computing & DevOps" required>
+                      </div>
+                      <div class="form-group">
+                          <label for="photo">Student Photo</label>
+                          <input type="file" id="photo" name="photo" accept="image/*" required>
+                      </div>
+                      <button type="submit">Register Student</button>
+                  </form>
+                  <div class="badge">
+                      Protected by IAM Instance Role & Private RDS Subnet
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+
+          chown -R ec2-user:ec2-user /home/ec2-user/pythoncodeAWS
+
+          # Setup systemd service
+          cat <<EOF > /etc/systemd/system/flaskapp.service
+          [Unit]
+          Description=Flask Student Registration App
+          After=network.target
+
+          [Service]
+          User=root
+          WorkingDirectory=/home/ec2-user/pythoncodeAWS
+          Environment="DB_HOST=${RDSInstance.Endpoint.Address}"
+          Environment="DB_USER=admin"
+          Environment="DB_PASSWORD=${DBPassword}"
+          Environment="DB_NAME=studentdb"
+          Environment="S3_BUCKET_NAME=${S3Bucket}"
+          Environment="AWS_REGION=${AWS::Region}"
+          ExecStart=/usr/bin/python3 -m gunicorn -w 3 -b 0.0.0.0:80 app:app
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now flaskapp
+
+Outputs:
+  WebsiteURL:
+    Description: URL to access the deployed Student Registration Web Application
+    Value: !Sub 'http://${EC2Instance.PublicIp}'
+  RDSMySQLHostname:
+    Description: Private RDS MySQL Endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref S3Bucket
+  EC2PublicIP:
+    Description: Public IP of the EC2 Instance
+    Value: !GetAtt EC2Instance.PublicIp

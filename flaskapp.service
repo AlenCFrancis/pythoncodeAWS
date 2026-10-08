@@ -1,0 +1,18 @@
+[Unit]
+Description=Flask Student Registration App
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/pythoncodeAWS
+Environment="DB_HOST=<your-rds-endpoint>"
+Environment="DB_USER=admin"
+Environment="DB_PASSWORD=<your-db-password>"
+Environment="DB_NAME=studentdb"
+Environment="S3_BUCKET_NAME=<your-bucket-name>"
+Environment="AWS_REGION=ap-south-1"
+ExecStart=/usr/local/bin/gunicorn -w 3 -b 0.0.0.0:80 app:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

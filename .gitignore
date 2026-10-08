@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*$py.class
+
+# Environments
+.env
+*.env
+.venv
+env/
+venv/
+
+# Keys and Secrets
+*.pem
+*.key
+
+# OS artifacts
+.DS_Store
+Thumbs.db
